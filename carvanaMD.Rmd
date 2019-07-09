@@ -1,0 +1,946 @@
+### Kaggle Competition:
+#### Carvana:  Don't Get Kicked
+
+Carvana hosted a Kaggle competition wherein competitors took data about US market automobiles at used car auctions in an attempt to determine whether the car was a "Good Buy" or a "Bad Buy" for the purchaser. Information about the challenge can be found on the Kaggle website at https://www.kaggle.com/c/DontGetKicked.
+
+Used car auctions provide a means for automotive dealerships to replenish their inventory of used cars to sell.  However, buying used cars, regardless of venue or intent, is never without risk.  In an effort to minimize this risk, automotive resellers must look at a number of different factors before they purchase a vehicle in order to maximize the returns on their investment.  Having to deal with issues such as major undisclosed needed repairs, odometer discrepancies, titling complications, etc., greatly increases the total cost incurred by dealers for each car, so being able to identify these types of vehicles in advance would be very beneficial to their process.
+
+### Data Loading
+
+#### Loading necessary R packages
+
+```{r Loading Packages, message = FALSE, warning = FALSE}
+require(tidyverse)
+require(caret)
+require(lubridate)
+require(mice)
+require(naniar)
+require(DMwR)
+require(pROC)
+require(xgboost)
+require(randomForest)
+require(e1071)
+require(corrplot)
+require(JOUSBoost)
+```
+
+#### Reading in the data and temporarily combining the datasets to facilitate data cleaning
+
+```{r Reading Data}
+wd <- "C:/Users/Bryan/Google Drive/Kaggle/Carvana/"
+train.set <- read.csv(paste(wd, "training.csv", sep = ""), stringsAsFactors = FALSE)
+test.set <- read.csv(paste(wd, "test.csv", sep = ""), stringsAsFactors = FALSE)
+test.set <- test.set %>% mutate(set = "test",
+                                IsBadBuy = NA)
+train.set <- train.set %>% mutate(set = "train")
+data.set <- rbind(train.set, test.set)
+rm(train.set); rm(test.set)
+```
+
+### Inspecting the Data
+
+The data isn't especially troublesome, but it is apparent that there is much that can be done to improve its overall structure.
+
+#### Examining the structure of the dataset
+
+Even with a cursory look at the data, it's apparent that there is a significant amount of data that can extracted and cleaned from a handful of fields.  
+
+```{r Examining Data Structure}
+summary(data.set)
+```
+
+### Data Cleaning and Processing
+
+The focus of this stage will be on processing several fields to get a number of new features and preparing several factor fields for means encoding.
+
+#### Renaming a misspelled predictor name
+
+```{r Misspelled Predictor}
+names(data.set)[which(names(data.set) == "MMRAcquisitonRetailCleanPrice")] <- "MMRAcquisitionRetailCleanPrice"
+```
+
+#### Creating new predictors based on date of vehicle purchase
+
+Date information can be very useful not only in providing an absolute measure of time, but also in generating factor variables that indirectly contribute to a model's predictive ability by uncovering hidden structures within the auction system that isn't represented elsewhere in the data.  As a simple example, if a specific auction takes place on Tuesdays and Fridays every week, but Fridays auctions only include cars that were not sold on Tuesdays and don't include any new acquisitions, then that could be potentially useful to know.
+
+```{r Purchase Date}
+data.set <- data.set %>% mutate(PurchDate = mdy(PurchDate)) %>%
+                         mutate(YearPurchased = year(PurchDate),
+                                MonthPurchased = month(PurchDate),
+                                DayPurchased = day(PurchDate)) %>%
+                         mutate(DayofWeekPurchased = as.factor(weekdays(PurchDate)),
+                                AdjDaysSincePurchase = as.numeric(max(PurchDate) - PurchDate)) %>%
+                         mutate(YearPurchased = as.factor(YearPurchased),
+                                MonthPurchased = as.factor(MonthPurchased),
+                                DayPurchased = as.factor(DayPurchased))
+```
+
+#### Comparing Vehicle Age to Vehicle Year
+
+Initially, it would seem that these two fields would represent the exact same information.  However, the Vehicle Year does not always correspond to the year that the vehicle was actually purchased.  2020 model year cars are often available for sale in 2019, for example, and the data bears that out.  
+
+```{r Comparing Year and Age}
+table(data.set$VehicleAge, data.set$VehYear)
+```
+
+#### Examining categorical predictor related to which auction the vehicle was purchased from
+
+```{r Auction Table}
+table(data.set$Auction)
+data.set$Auction <- as.factor(data.set$Auction)
+```
+
+#### Examining and correcting vehicle make information as needed
+
+The beginning of the data cleaning/normalization process.
+
+```{r Vehicle Make Information}
+data.set$Make <- as.factor(data.set$Make)
+table(data.set$Make)
+data.set$Make[data.set$Make == "PLYMOUTH"] <- "DODGE"
+data.set$Make[data.set$Make == "TOYOTA SCION"] <- "SCION"
+data.set$Make[data.set$Make == "HUMMER"] <- "GMC"
+```
+
+#### Generating new predictor variables based on model information.  
+
+This serves two purposes; it separates potentially important data into multiple predictors and it allows for reduction in overall number of vehicle model levels.  From this process, the data will now include predictors regarding each car's drive system (4WD, AWD, 2WD), its number of cylinders (4, 6, 8), the drive wheels (Front, Rear, All), it's engine size (measured by liters of displacement) and whether it's a hybrid or not.
+
+```{r New predictors DriveType NumCyls DriveWheels LitersDisp}
+data.set <- data.set %>% mutate(DriveType = case_when(grepl("AWD", Model) == TRUE ~ "AWD",
+                                                      grepl("4WD", Model) == TRUE ~ "4WD",
+                                                      grepl("AWD|4WD", Model) == FALSE ~ "2WD"),
+                                NumCyls = case_when(grepl("V8|8C|V-8|V 8", Model) == TRUE ~ 8,
+                                                    grepl("V6|I6|6C|V-6|I-6|V 6|I 6", Model) == TRUE ~ 6,
+                                                    grepl("I4|4C|I-4|I 4", Model) == TRUE ~ 4,
+                                                    grepl("V8|V6|I6|I4|8C|6C|4C|V-8|V-6|I-4|I 4|V 8|V 6|I 6", Model) == FALSE ~ 0)) %>%
+                        mutate(DriveWheels = case_when(grepl("FWD", Model) == TRUE ~ "Front",
+                                                       grepl("RWD", Model) == TRUE ~ "Rear",
+                                                       grepl("AWD", Model) == TRUE ~ "All"),
+                               Model = gsub(" AWD| 4WD| 2WD| V8| V6| I6| I4| RWD| FWD| 8C| 6C| 4C| PICKUP| V-8| V-6", "", Model)) %>%
+                        mutate(Model = gsub(" I-4| I-6| I 6| I 4| V 6| V 8| PICKU| PIC", "", Model)) %>% 
+                        mutate(LitersDisp = as.numeric(str_extract(Model, "[0-9]\\.[0.9]"))) %>%
+                        mutate(Model = gsub(" [0-9]\\.[0-9]L| EFI| MPI| SPI| MFI| SFI|[[:punct:]]", "", Model)) %>%
+                        mutate(Model = trimws(gsub("HYBRID", "", Model)))
+```
+
+#### Normalizing entries for vehicle model data
+
+```{r Normalizing Vehicle Model}
+data.set$Model <- gsub("1500.*SIERRA.*", "1500 SIERRA", data.set$Model)
+data.set$Model <- gsub("1500.*SILVERADO.*", "1500 SILVERADO", data.set$Model)
+data.set$Model <- gsub("2500.*SILVERADO.*", "2500 SILVERADO", data.set$Model)
+data.set$Model <- gsub("300.*", "300", data.set$Model)
+data.set$Model <- gsub("32 CL.*", "32 CL", data.set$Model)
+data.set$Model <- gsub("32 TL.*", "32 TL", data.set$Model)
+data.set$Model <- gsub("350Z.*", "350Z", data.set$Model)
+data.set$Model <- gsub("626.*", "626", data.set$Model)
+data.set$Model <- gsub("ACCORD.*", "ACCORD", data.set$Model)
+data.set$Model <- gsub("AERIO.*", "AERIO", data.set$Model)
+data.set$Model <- gsub("ALERO.*", "ALERO", data.set$Model)
+data.set$Model <- gsub("ALTIMA.*", "ALTIMA", data.set$Model)
+data.set$Model <- gsub("ARMADA.*", "ARMADA", data.set$Model)
+data.set$Model <- gsub("AVALON.*", "AVALON", data.set$Model)
+data.set$Model <- gsub("AVENGER.*", "AVENGER", data.set$Model)
+data.set$Model <- gsub("AVEO.*", "AVEO", data.set$Model)
+data.set$Model <- gsub("BONNEVILLE.*", "BONNEVILLE", data.set$Model)
+data.set$Model <- gsub("CAMARO.*", "CAMARO", data.set$Model)
+data.set$Model <- gsub("CAMRY.*SOLARA.*", "SOLARO", data.set$Model)
+data.set$Model <- gsub("CAMRY.*", "CAMRY", data.set$Model)
+data.set$Model <- gsub("CARAVAN SE.*", "CARAVAN", data.set$Model)
+data.set$Model <- gsub("CANYON.*", "CANYON", data.set$Model)
+data.set$Model <- gsub("CENTURY.*", "CENTURY", data.set$Model)
+data.set$Model <- gsub("CHARGER.*", "CHARGER", data.set$Model)
+data.set$Model <- gsub("CIVIC.*", "CIVIC", data.set$Model)
+data.set$Model <- gsub("COMMANDER.*", "COMMANDER", data.set$Model)
+data.set$Model <- gsub("CENTURY.*", "CENTURY", data.set$Model)
+data.set$Model <- gsub("COOPER.*", "COOPER", data.set$Model)
+data.set$Model <- gsub("COROLLA.*", "COROLLA", data.set$Model)
+data.set$Model <- gsub("COUPE.*", "COUPE", data.set$Model)
+data.set$Model <- gsub("CRV.*", "CRV", data.set$Model)
+data.set$Model <- gsub("DURANGO.*", "DURANGO", data.set$Model)
+data.set$Model <- gsub("ECHO.*", "ECHO", data.set$Model)
+data.set$Model <- gsub("ECLIPSE.*", "ECLIPSE", data.set$Model)
+data.set$Model <- gsub("ENVOY.*", "ENVOY", data.set$Model)
+data.set$Model <- gsub("ES300.*", "ES300", data.set$Model)
+data.set$Model <- gsub("ESCAPE.*", "ESCAPE", data.set$Model)
+data.set$Model <- gsub("ESCORT.*", "ESCORT", data.set$Model)
+data.set$Model <- gsub("EXCURSION.*", "EXCURSION", data.set$Model)
+data.set$Model <- gsub("EXPEDITION.*", "EXPEDITION", data.set$Model)
+data.set$Model <- gsub("F150.*", "F150", data.set$Model)
+data.set$Model <- gsub("F250.*", "F250", data.set$Model)
+data.set$Model <- gsub("FOCUS.*", "FOCUS", data.set$Model)
+data.set$Model <- gsub("FORENZA.*", "FORENZA", data.set$Model)
+data.set$Model <- gsub("FREESTYLE.*", "FREESTYLE", data.set$Model)
+data.set$Model <- gsub("FUSION.*", "FUSION", data.set$Model)
+data.set$Model <- gsub("G35.*", "G35", data.set$Model)
+data.set$Model <- gsub("GALANT.*", "GALANT", data.set$Model)
+data.set$Model <- gsub("GRAND AM.*", "GRAND AM", data.set$Model)
+data.set$Model <- gsub("GRAND CHEROKEE.*", "GRAND CHEROKEE", data.set$Model)
+data.set$Model <- gsub("GRAND MARQUIS.*", "GRAND MARQUIS", data.set$Model)
+data.set$Model <- gsub("GRAND PRIX.*", "GRAND PRIX", data.set$Model)
+data.set$Model <- gsub("GRAND VITARA.*", "GRAND VITARA", data.set$Model)
+data.set$Model <- gsub("HHR.*", "HHR", data.set$Model)
+data.set$Model <- gsub("HIGHLANDER.*", "HIGHLANDER", data.set$Model)
+data.set$Model <- gsub("I30.*", "I30", data.set$Model)
+data.set$Model <- gsub("I35.*", "I35", data.set$Model)
+data.set$Model <- gsub("IMPALA.*", "IMPALA", data.set$Model)
+data.set$Model <- gsub("ION.*", "ION", data.set$Model)
+data.set$Model <- gsub("JETTA.*", "JETTA", data.set$Model)
+data.set$Model <- gsub("L SERIES.*", "L SERIES", data.set$Model)
+data.set$Model <- gsub("LE SABRE.*", "LE SABRE", data.set$Model)
+data.set$Model <- gsub("^LS *", "LS", data.set$Model)
+data.set$Model <- gsub("LS DO", "LS", data.set$Model)
+data.set$Model <- gsub("LUCERNE.*", "LUCERNE", data.set$Model)
+data.set$Model <- gsub("M45.*", "M45", data.set$Model)
+data.set$Model <- gsub("MAGNUM.*", "MAGNUM", data.set$Model)
+data.set$Model <- gsub("MALIBU.*", "MALIBU", data.set$Model)
+data.set$Model <- gsub("MATRIX.*", "MATRIX", data.set$Model)
+data.set$Model <- gsub("MAXIMA.*", "MAXIMA", data.set$Model)
+data.set$Model <- gsub("MAZDA6.*", "MAZDA6", data.set$Model)
+data.set$Model <- gsub("MDX.*", "MDX", data.set$Model)
+data.set$Model <- gsub("MIATA.*", "MIATA", data.set$Model)
+data.set$Model <- gsub("MONTANA.*", "MONTANA", data.set$Model)
+data.set$Model <- gsub("MPV.*", "MPV", data.set$Model)
+data.set$Model <- gsub("MOUNTAINEER.*", "MOUNTAINEER", data.set$Model)
+data.set$Model <- gsub("MURANO.*", "MURANO", data.set$Model)
+data.set$Model <- gsub("MUSTANG.*", "MUSTANG", data.set$Model)
+data.set$Model <- gsub("NAVIGATOR.*", "NAVIGATOR", data.set$Model)
+data.set$Model <- gsub("NEON.*", "NEON", data.set$Model)
+data.set$Model <- gsub("OPTIMA.*", "OPTIMA", data.set$Model)
+data.set$Model <- gsub("OUTLANDER.*", "OUTLANDER", data.set$Model)
+data.set$Model <- gsub("PACIFICA.*", "PACIFICA", data.set$Model, ignore.case = TRUE)
+data.set$Model <- gsub("PATHFINDER.*", "PATHFINDER", data.set$Model)
+data.set$Model <- gsub("PILOT.*", "PILOT", data.set$Model)
+data.set$Model <- gsub("PRIUS.*", "PRIUS", data.set$Model)
+data.set$Model <- gsub("PRIZM.*", "PRIZM", data.set$Model)
+data.set$Model <- gsub("PROTEGE 5.*", "PROTEGE 5", data.set$Model)
+data.set$Model <- gsub("PT CRUISER.*", "PT CRUISER", data.set$Model)
+data.set$Model <- gsub("QX4.*", "QX4", data.set$Model)
+data.set$Model <- gsub("RAIDER.*", "RAIDER", data.set$Model)
+data.set$Model <- gsub("RAV4.*", "RAV4", data.set$Model)
+data.set$Model <- gsub("RENO.*", "RENO", data.set$Model)
+data.set$Model <- gsub("RIO.*", "RIO", data.set$Model)
+data.set$Model <- gsub("RONDO.*", "RONDO", data.set$Model)
+data.set$Model <- gsub("RX300.*", "RX300", data.set$Model)
+data.set$Model <- gsub("S SERIES.*", "S SERIES", data.set$Model)
+data.set$Model <- gsub("S10.*", "S10", data.set$Model)
+data.set$Model <- gsub("SABLE.*", "SABLE", data.set$Model)
+data.set$Model <- gsub("SANTA FE.*", "SANTA FE", data.set$Model)
+data.set$Model <- gsub("SEBRING.*", "SEBRING", data.set$Model)
+data.set$Model <- gsub("SENTRA.*", "SENTRA", data.set$Model)
+data.set$Model <- gsub("SIENNA.*", "SIENNA", data.set$Model)
+data.set$Model <- gsub("SIERRA.*1500.*", "1500 SIERRA", data.set$Model)
+data.set$Model <- gsub("SILHOUETTE.*", "SILHOUETTE", data.set$Model)
+data.set$Model <- gsub("SONATA.*", "SONATA", data.set$Model)
+data.set$Model <- gsub("SPECTRA.*", "SPECTRA", data.set$Model)
+data.set$Model <- gsub("SPORTAGE.*", "SPORTAGE", data.set$Model)
+data.set$Model <- gsub("SRX.*", "SRX", data.set$Model)
+data.set$Model <- gsub("STRATUS.*", "STRATUS", data.set$Model)
+data.set$Model <- gsub("SUBURBAN 1500.*", "SUBURBAN 1500", data.set$Model)
+data.set$Model <- gsub("SUBURBAN 2500.*", "SUBURBAN 2500", data.set$Model)
+data.set$Model <- gsub("SUNFIRE.*", "SUNFIRE", data.set$Model)
+data.set$Model <- gsub("TAHOE.*", "TAHOE", data.set$Model)
+data.set$Model <- gsub("TAURUS.*", "TAURUS", data.set$Model)
+data.set$Model <- gsub("TC.*", "TC", data.set$Model)
+data.set$Model <- gsub("TRAILBLAZER.*", "TRAILBLAZER", data.set$Model)
+data.set$Model <- gsub("TUCSON.*", "TUCSON", data.set$Model)
+data.set$Model <- gsub("VERONA.*", "VERONA", data.set$Model)
+data.set$Model <- gsub("VIBE.*", "VIBE", data.set$Model)
+data.set$Model <- gsub("VITARA.*", "VITARA", data.set$Model)
+data.set$Model <- gsub("VUE.*", "VUE", data.set$Model)
+data.set$Model <- gsub("XB.*", "XB", data.set$Model)
+data.set$Model <- gsub("XG 300.*", "XG 300", data.set$Model)
+data.set$Model <- gsub("XG 350.*", "XG 350", data.set$Model)
+data.set$Model <- gsub("XL7.*", "XL7", data.set$Model)
+data.set$Model <- gsub("XTERRA.*", "XTERRA", data.set$Model)
+data.set$Model <- gsub("YUKON XL 1500.*", "YUKON XL 1500", data.set$Model)
+data.set$Model <- as.factor(data.set$Model)
+```
+
+#### Imputing new factor level for listing where vehicle trim is not listed
+
+```{r Base Trim Level}
+data.set$Trim[is.na(data.set$Trim)] <- "Bas"
+data.set$Trim[data.set$Trim == ""] <- "Bas"
+data.set$Trim <- as.factor(data.set$Trim)
+```
+
+#### Extracting data from vehicle submodel to be used for LitersDisp (liters of displacement) field
+
+isnaLD <- is.na(data.set$LitersDisp)
+data.set$LitersDisp[isnaLD] <- as.numeric(str_extract(data.set$SubModel[isnaLD], "[1-9]\\.[0-9]"))
+data.set$SubModel <- gsub("[1-9]\\.[0-9]L", "", data.set$SubModel)
+data.set$SubModel <- gsub("[1-9]\\.[0.9]", "", data.set$SubModel)
+rm(isnaLD)
+
+#### Checking data regarding engine size (LitersDisp).  
+
+Unfortunately, there are far too many NA values to be of much use.  Removing LitersDisp field from dataset.
+
+```{r LitersDisp Removal}
+sum(is.na(data.set$LitersDisp))
+data.set <- select(data.set, -LitersDisp)
+```
+
+#### Cleaning and normalizing data for vehicle submodel information
+
+There are currently 252 vehicle submodels (and hence, 252 potential factor levels) in the data.  Compacting/normalizing similar submodels should greatly reduce that number without affecting model accuracy.
+
+```{r Normalizing Submodels}
+subModelTerms <- paste(data.set$SubModel, collapse = " ")
+subModelTerms <- str_split(subModelTerms, " ")
+t <- table(subModelTerms)
+length(t)
+```
+
+```{r More Normalizing Submodels}
+data.set$SubModel <- trimws(gsub(" *\\b[[:alnum:]]{1,2}\\b* | *\\b[[:alnum:]]{1,2}\\b*", " ", data.set$SubModel))
+data.set$SubModel <- gsub(".*UTILITY.*", "SUV", data.set$SubModel)
+data.set$SubModel <- gsub(".*SUV.*|.*CUV.*|.*CUV.*", "SUV", data.set$SubModel)
+data.set$SubModel <- gsub(".*SEDAN.*", "SEDAN", data.set$SubModel)
+data.set$SubModel <- gsub(".*COUPE.*", "COUPE", data.set$SubModel)
+data.set$SubModel <- gsub(".*QUAD CAB.*", "QUAD CAB", data.set$SubModel)
+data.set$SubModel <- gsub(".*MINIVAN.*", "MINIVAN", data.set$SubModel)
+data.set$SubModel <- gsub(".*WAGON.*", "WAGON", data.set$SubModel)
+data.set$SubModel <- gsub(".*REG.*CAB.*", "REG CAB", data.set$SubModel)
+data.set$SubModel <- gsub(".*CONVERTIBLE.*", "CONVERTIBLE", data.set$SubModel)
+data.set$SubModel <- gsub(".*SPYDER.*", "CONVERTIBLE", data.set$SubModel)
+data.set$SubModel <- gsub(".*ROADSTER.*", "CONVERTIBLE", data.set$SubModel)
+data.set$SubModel <- gsub(".*LARIAT.*", "LARIAT", data.set$SubModel)
+data.set$SubModel <- gsub(".*CREW.*", "CREW", data.set$SubModel)
+data.set$SubModel <- gsub(".*HARDTOP.*|.*HARTOP.*", "HARDTOP", data.set$SubModel)
+data.set$SubModel <- gsub(".*SR5.*", "SR5", data.set$SubModel)
+data.set$SubModel <- gsub(".*TOUR.*", "TOURING", data.set$SubModel)
+data.set$SubModel <- gsub(".*HAT.*BACK.*", "HATCHBACK", data.set$SubModel)
+data.set$SubModel <- gsub(".*CROSS.*", "CROSSOVER", data.set$SubModel)
+data.set$SubModel <- gsub(".*EXT.*", "EXT", data.set$SubModel)
+data.set$SubModel <- gsub(".*DOUBLE CAB.*", "QUAD CAB", data.set$SubModel)
+data.set$SubModel <- gsub(".*SPORT.*", "SPORT", data.set$SubModel)
+data.set$SubModel <- gsub(".*MEGA CAB.*", "QUAD CAB", data.set$SubModel)
+data.set$SubModel <- gsub(".*PASSENGER.*", "", data.set$SubModel)
+data.set$SubModel <- gsub(".*MAZDA3.*", "", data.set$SubModel)
+data.set$SubModel <- gsub(".*JEEP.*", "", data.set$SubModel)
+data.set$SubModel <- gsub(".*NULL.*", "", data.set$SubModel)
+data.set$SubModel[data.set$SubModel == ""] <- "MINIVAN"
+data.set$SubModel <- as.factor(data.set$SubModel)
+rm(subModelTerms)
+```
+
+#### Examining basic information regarding vehicle colors
+
+```{r Colors}
+table(data.set$Color)
+data.set$Color[data.set$Color == "NOT AVAIL"] <- "NULL" 
+data.set$Color[data.set$Color == ""] <- "NULL" 
+data.set$Color <- as.factor(data.set$Color)
+```
+
+#### Examining basic information regarding vehicle transmission type.  
+
+Since an overwhelming majority of vehicles manufactured for the US market are automatics, NA entries were converted to Automatic.
+
+```{r Transmission Type}
+table(data.set$Transmission)
+data.set$Transmission <- gsub("Manual", "MANUAL", data.set$Transmission)
+data.set$Transmission <- gsub("NULL", "AUTO", data.set$Transmission)
+data.set$Transmission[data.set$Transmission == ""] <- "AUTO"
+data.set$Transmission <- as.numeric(as.factor(data.set$Transmission)) - 1
+```
+
+#### Examining WheelType and WheelTypeID fields.
+
+WheelType and WheelTypeID are very highly correlated predictors and therefore both do not need to be included in the data.  Removing WheelTypeID from the dataset.
+
+```{r WheelType}
+table(data.set$WheelType, data.set$WheelTypeID)
+data.set$WheelType[data.set$WheelType == "NULL"] <- NA
+data.set$WheelType <- as.factor(data.set$WheelType)
+data.set <- select(data.set, -WheelTypeID)
+```
+
+#### Correcting listings for country of manufacture and generating predictor reflecting manufacturer's parent company
+
+The classification of "TOP LINE ASIAN" under Nationality (which represents the home country of the manufacturer of each vehicle) is not only incorrect but also arbitrary.  Additionally, there are other numerous errors and inconsistencies with other listings that need to be corrected.  "TopThreeAmericanName" field is equally arbitrary and is data that already captured by the "Make" field and therefore does not need to be included in the data.  To better capture underlying potential data trends, ParentCompany field has been added.
+
+```{r Nationality and ParentyCompany}
+table(data.set$Make, data.set$Nationality)
+unique(data.set$Make[data.set$Nationality == "TOP LINE ASIAN"])
+data.set <- data.set %>% mutate(Nationality = case_when(Make == "ACURA" ~ "JAPANESE",
+                                                        Make == "BUICK" ~ "AMERICAN",
+                                                        Make == "CADILLAC" ~ "AMERICAN",
+                                                        Make == "CHEVROLET" ~ "AMERICAN", 
+                                                        Make == "CHRYSLER" ~ "AMERICAN",
+                                                        Make == "DODGE" ~ "AMERICAN", 
+                                                        Make == "FORD" ~ "AMERICAN",
+                                                        Make == "GMC" ~ "AMERICAN",
+                                                        Make == "HONDA" ~ "JAPANESE",
+                                                        Make == "HYUNDAI" ~ "KOREAN",
+                                                        Make == "INFINITI" ~ "JAPANESE",
+                                                        Make == "ISUZU" ~ "JAPANESE",
+                                                        Make == "JEEP" ~ "AMERICAN",
+                                                        Make == "KIA" ~ "KOREAN",
+                                                        Make == "LEXUS" ~ "JAPANESE",
+                                                        Make == "LINCOLN" ~ "AMERICAN",
+                                                        Make == "MAZDA" ~ "JAPANESE",
+                                                        Make == "MERCURY" ~ "AMERICAN",
+                                                        Make == "MINI" ~ "EUROPEAN",
+                                                        Make == "MITSUBISHI" ~ "JAPANESE",
+                                                        Make == "NISSAN" ~ "JAPANESE",
+                                                        Make == "OLDSMOBILE" ~ "AMERICAN",
+                                                        Make == "PLYMOUTH" ~ "AMERICAN",
+                                                        Make == "PONTIAC" ~ "AMERICAN",
+                                                        Make == "SATURN" ~ "AMERICAN",
+                                                        Make == "SCION" ~ "JAPANESE",
+                                                        Make == "SUBARU" ~ "JAPANESE",
+                                                        Make == "SUZUKI" ~ "JAPANESE",
+                                                        Make == "TOYOTA" ~ "JAPANESE",
+                                                        Make == "VOLKSWAGEN" ~ "EUROPEAN",
+                                                        Make == "VOLVO" ~ "EUROPEAN"),
+                                ParentCompany = case_when(Make == "ACURA" ~ "HONDA",
+                                                          Make == "BUICK" ~ "GM",
+                                                          Make == "CADILLAC" ~ "GM",
+                                                          Make == "CHEVROLET" ~ "GM", 
+                                                          Make == "CHRYSLER" ~ "CHRYSLER",
+                                                          Make == "DODGE" ~ "CHRYSLER", 
+                                                          Make == "FORD" ~ "FORD",
+                                                          Make == "GMC" ~ "GMC",
+                                                          Make == "HONDA" ~ "HONDA",
+                                                          Make == "HYUNDAI" ~ "HYUNDAI",
+                                                          Make == "INFINITI" ~ "NISSAN",
+                                                          Make == "ISUZU" ~ "ISUZU",
+                                                          Make == "JEEP" ~ "CHRYSLER",
+                                                          Make == "KIA" ~ "KIA",
+                                                          Make == "LEXUS" ~ "TOYOTA",
+                                                          Make == "LINCOLN" ~ "FORD",
+                                                          Make == "MAZDA" ~ "MAZDA",
+                                                          Make == "MERCURY" ~ "FORD",
+                                                          Make == "MINI" ~ "BMW",
+                                                          Make == "MITSUBISHI" ~ "MITSUBISHI",
+                                                          Make == "NISSAN" ~ "NISSAN",
+                                                          Make == "OLDSMOBILE" ~ "GM",
+                                                          Make == "PLYMOUTH" ~ "CHRYSLER",
+                                                          Make == "PONTIAC" ~ "GM",
+                                                          Make == "SATURN" ~ "GM",
+                                                          Make == "SCION" ~ "TOYOTA",
+                                                          Make == "SUBARU" ~ "SUBARU",
+                                                          Make == "SUZUKI" ~ "SUZUKI",
+                                                          Make == "TOYOTA" ~ "TOYOTA",
+                                                          Make == "VOLKSWAGEN" ~ "VOLKSWAGEN",
+                                                          Make == "VOLVO" ~ "VOLVO"))
+data.set$Nationality <- as.factor(data.set$Nationality)
+data.set$ParentCompany <- as.factor(data.set$ParentCompany)
+data.set <- select(data.set, -TopThreeAmericanName)
+```
+
+#### Examining and confirming that DriveType field doesn't contain any extraneous/NA information
+
+```{r DriveType Errors}
+table(data.set$DriveType)
+sum(is.na(data.set$DriveType))
+data.set$DriveType <- as.factor(data.set$DriveType)
+```
+
+#### Examining vehicle Size field
+
+Converting NULL data to NA for later imputation calculations
+
+```{r Vehicle Size}
+table(data.set$Size)
+data.set$Size[data.set$Size == "NULL"] <- NA
+data.set$Size <- as.factor(data.set$Size)
+```
+
+#### Examining and manually imputing data regarding vehicle DriveWheels information
+
+```{r Vehicle Drive Wheels Impute}
+table(data.set$DriveWheels)
+data.set$DriveWheels <- as.factor(data.set$DriveWheels)
+levels(data.set$DriveWheels) <- c(levels(data.set$DriveWheels), "Truck", "SUV")
+str(data.set$DriveWheels)
+sum(is.na(data.set$DriveWheels))    
+data.set$DriveWheels[data.set$SubModel == "MINIVAN"] <- "Front"
+data.set$DriveWheels[data.set$Make == "ACURA"] <- "Front"
+data.set$DriveWheels[data.set$Make == "BUICK"] <- "Front"
+data.set$DriveWheels[data.set$Make == "CHRYSLER"] <- "Front"
+data.set$DriveWheels[data.set$Make == "HONDA"] <- "Front"
+data.set$DriveWheels[data.set$Make == "OLDSMOBILE"] <- "Front"
+data.set$DriveWheels[data.set$Make == "MINI"] <- "Front"
+data.set$DriveWheels[data.set$Make == "HUMMER"] <- "All"
+data.set$DriveWheels[data.set$Make == "HYUNDAI"] <- "Front"
+data.set$DriveWheels[data.set$Make == "ISUZU"] <- "All"
+data.set$DriveWheels[data.set$Make == "KIA"] <- "Front"
+data.set$DriveWheels[data.set$Make == "SCION"] <- "Front"
+data.set$DriveWheels[data.set$Make == "SUZUKI"] <- "Front"
+data.set$DriveWheels[grep(".*TRUCK.*", data.set$Size)] <- "Truck"
+data.set$DriveWheels[grep(".*SUV.*", data.set$Size)] <- "SUV"
+data.set$DriveWheels[grep("^VAN", data.set$Size)] <- "Rear"
+data.set$DriveWheels[grep("CROWN VICTORIA|GRAND MARQUIS|GS300|GS350|GS450H|HHR|M35|M45|MAGNUM|MIATA|MR2|SPYDER|MUSTANG|Q45|LS|SOLSTICE", data.set$Model)] <- "Rear"
+data.set$DriveWheels[data.set$Make == "SUBARU"] <- "All"
+data.set$DriveWheels[data.set$Make == "JEEP"] <- "All"
+data.set$DriveWheels[data.set$Submodel == "WRANGLER"] <- "Front"
+data.set$DriveWheels[is.na(data.set$DriveWheels)] <- "Front"
+```
+
+#### Converting incorrect NumCyls entries to NA for imputation calculations
+
+```{r NumCyls}
+data.set$NumCyls[data.set$NumCyls == 0] <- NA
+data.set$NumCyls <- as.factor(data.set$NumCyls)
+```
+
+#### Converting values in multiple pricing fields to NA for imputation purposes
+
+There are 8 separate fields that relate to historical cost and sale prices for models in each listing. Further analysis on these fields will be done later, but for imputation purposes, any missing or 0 values have been converted to NA. 
+
+```{r NA MMR}
+for (i in grep("MMR.*", names(data.set))) {
+        n <- union(which(data.set[,i] == "0"), which(data.set[,i] == "NULL"))
+        data.set[n,i] <- NA
+        data.set[,i] <- as.numeric(data.set[,i])
+}
+```
+
+#### Examining PRIMEUNIT and AUCGUART fields
+
+Due to the high level of correlation between the two, AUCGUART has been removed and another binary field that notates listings that are not complimentary to one another.  
+
+```{r PRIMEUNIT AUCGUART}
+table(data.set$PRIMEUNIT)
+table(data.set$AUCGUART)
+table(data.set$PRIMEUNIT, data.set$AUCGUART)
+data.set <- data.set %>% mutate(PRIMEUNIT = as.factor(PRIMEUNIT),
+                                PRIMEAUCDISC = ifelse(PRIMEUNIT == "NO" & AUCGUART == "GREEN", 1, 0)) %>%
+                         select(-AUCGUART)
+```
+
+#### Inspecting BYRNO data
+
+```{r BYRNO}
+table(data.set$BYRNO)
+data.set$BYRNO <- as.factor(data.set$BYRNO)
+```
+
+#### Examining zip code and state data to make sure there are no extraneous/NA values
+
+```{r ZIP CODE STATE}
+table(data.set$VNZIP1)
+table(data.set$VNST)
+data.set$VNZIP1 <- as.factor(data.set$VNZIP1)
+data.set$VNST <- as.factor(data.set$VNST)
+```
+
+#### Generating means encoding function 
+
+Means encoding is a as a way to encode categorical factor with large a number of levels into a single numeric predictor.  However, because the test set is included in the data, we must first impute "IsBadBuy" values for test set entries.  Additionally, to prevent overfitting, each means encoded value has a small error built into it to simulate a sample dropout rate.
+
+```{r Means Encoding Function}
+means_encoding <- function(dataframe, featurename, dependent) {
+        me <- select(dataframe, featurename, dependent)
+        names(me) <- c("name", "kick")
+        tme <- as.data.frame(table(me$kick))
+        navalue <- tme$Freq[tme$Var1 == 1]/sum(tme$Freq)
+        me$kick <- case_when(is.na(me$kick) == TRUE ~ navalue,
+                             me$kick == 1 ~ 1,
+                             me$kick == 0 ~ 0
+        )
+        value <- me %>% 
+                 group_by(name) %>%
+                 summarize(mean_encode = mean(kick))
+        m <- merge(me, value, by.x = "name", by.y = "name", all.x = TRUE)
+        m <- m[,3]
+        m <- m + runif(1, -0.05*m, 0.05*m)
+        return(m)
+}
+```
+
+#### Generating means encoded fields for numerous factor variables
+
+```{r Means Encoding Mutation}
+data.set <- data.set %>% mutate(meVNZIP1 = means_encoding(data.set, "VNZIP1", "IsBadBuy"),
+                                meVNST = means_encoding(data.set, "VNST", "IsBadBuy"),
+                                meMake = means_encoding(data.set, "Make", "IsBadBuy"),
+                                meModel = means_encoding(data.set, "Model", "IsBadBuy"),
+                                meNationality = means_encoding(data.set, "Nationality", "IsBadBuy"),
+                                meTrim = means_encoding(data.set, "Trim", "IsBadBuy"),
+                                meBYRNO = means_encoding(data.set, "BYRNO", "IsBadBuy"),
+                                meAuction = means_encoding(data.set, "Auction", "IsBadBuy"),
+                                meSubModel = means_encoding(data.set, "SubModel", "IsBadBuy"),
+                                meParentCompany = means_encoding(data.set, "ParentCompany", "IsBadBuy"),
+                                meColor = means_encoding(data.set, "Color", "IsBadBuy"),
+                                mePRIMEUNIT = means_encoding(data.set, "PRIMEUNIT", "IsBadBuy"),
+                                meDayofWeekPurchased = means_encoding(data.set, "DayofWeekPurchased", "IsBadBuy"),
+                                meDriveType = means_encoding(data.set, "DriveType", "IsBadBuy"),
+                                meDriveWheels = means_encoding(data.set, "DriveWheels", "IsBadBuy"),
+                                meYearPurchased = means_encoding(data.set, "YearPurchased", "IsBadBuy"),
+                                meMonthPurchased = means_encoding(data.set, "MonthPurchased", "IsBadBuy"),
+                                meDayPurchased = means_encoding(data.set, "DayPurchased", "IsBadBuy"))
+
+data.set <- select(data.set, -VNZIP1, -VNST, -Make, -Model, -Nationality, -Trim, -BYRNO, -PurchDate, -Auction, -ParentCompany,
+                  -SubModel, -Color, -PRIMEUNIT, -DayofWeekPurchased, -DriveType, -DriveWheels, -YearPurchased, -MonthPurchased, 
+                  -DayPurchased)
+```
+
+#### Plotting historical pricing distributions and noting any potential irregularities
+
+```{r Plot MMR}
+g <- data.set[,grep("MMR", names(data.set))] 
+g <- gather(g, key = "MMRtype")
+p <- ggplot(data = g, aes(x= MMRtype, y = value)) + geom_violin()
+suppressWarnings(plot(p))
+rm(g)
+```
+
+#### Notating historical pricing errors for data imputation
+
+Vehicle pricing data can be incorrect or incomplete.  While vehicle value changes over time, certain tenets always hold true.  For example, 'Clean' vehicles are always worth more than 'Average' cars and 'Auction' values are always lower than 'Retail' values.  Identifying values that do not follow these basic tenets and setting them to NA for imputation purposes.
+
+```{r MMR Discrepancies}
+data.set$MMRAcquisitionAuctionCleanPrice[data.set$MMRAcquisitionAuctionCleanPrice <= min(data.set$MMRAcquisitionAuctionAveragePrice, na.rm = TRUE)] <- NA
+data.set$MMRCurrentAuctionCleanPrice[data.set$MMRCurrentAuctionCleanPrice <= min(data.set$MMRCurrentAuctionAveragePrice, na.rm = TRUE)] <- NA
+
+p <- ggplot(data = data.set, aes(x = VehBCost)) + geom_histogram(binwidth = 2000, aes(fill = ..count..))
+p <- p + stat_bin(binwidth = 2000, geom = "text", aes(label = ..count..), vjust = -1)
+plot(p)
+range(data.set$VehBCost)
+data.set$VehBCost[data.set$VehBCost == 1] <- NA
+```
+
+#### Visualizing missing data
+
+```{r Missing Data}
+gg_miss_var(data.set, show_pct = TRUE)
+```
+
+#### Creating function that returns the mode of a list of numbers
+
+```{r Mode Function}
+mode <- function(array) {
+        t <- as.data.frame(table(array))
+        t <- t[order(t$Freq, decreasing = TRUE),]
+        m <- head(t$array, 1)
+        return(m)
+}
+```
+
+#### Data Imputation
+
+The imputation process has been divided up into multiple stages since imputation of certain fields could likely benefit from data in fields that also require imputed data to be complete.  Furthermore, in an attempt to minimize processing time, only a handful of relevant fields have been chosen to use for imputation calculations.  For example, the ZIP code in which a car is purchased is highly  unlikely to have any predicting influence on the number of cyclinders the car has and can therefore be discarded for imputation purposes.
+
+Imputing NumCyls field
+
+```{r Impute NumCyls, warning = FALSE, message = FALSE, results = "hide"}
+sub.data.numcyls <- select(data.set, VehYear, meTrim, meSubModel, meModel, meMake, NumCyls)
+impute.data <- mice(sub.data.numcyls, m = 7, maxit = 5)
+data.set$NumCyls[is.na(data.set$NumCyls)] <- apply(impute.data$imp$NumCyls, 1, mode)
+rm(sub.data.numcyls);rm(impute.data)
+```
+
+Imputing WheelType field
+
+```{r Impute WheeType, warning = FALSE, message = FALSE, results = "hide"}
+sub.data.wheels <- select(data.set, VehYear, meTrim, meSubModel, meModel, meMake, NumCyls, WheelType)
+impute.data <- mice(sub.data.wheels, m = 7, maxit = 5)
+data.set$WheelType[is.na(data.set$WheelType)] <- apply(impute.data$imp$WheelType, 1, mode)
+rm(sub.data.wheels);rm(impute.data)
+```
+
+Imputing Historical Pricing fields
+
+```{r Impute MMR, warning = FALSE, message = FALSE, results = "hide"}
+sub.data.MMR <- select(data.set, VehYear, meTrim, meSubModel, meModel, meMake, NumCyls, WheelType, WarrantyCost, AdjDaysSincePurchase, 
+                       MMRAcquisitionAuctionAveragePrice, MMRAcquisitionAuctionCleanPrice, MMRAcquisitionRetailAveragePrice,
+                       MMRAcquisitionRetailCleanPrice, MMRCurrentAuctionAveragePrice, MMRCurrentAuctionCleanPrice,
+                       MMRCurrentRetailAveragePrice, MMRCurrentRetailCleanPrice)
+impute.data <- mice(sub.data.MMR, m = 7, maxit = 5, method = "cart")
+data.set$MMRAcquisitionAuctionAveragePrice[is.na(data.set$MMRAcquisitionAuctionAveragePrice)] <-
+      apply(impute.data$imp$MMRAcquisitionAuctionAveragePrice, 1, mean)
+data.set$MMRAcquisitionAuctionCleanPrice[is.na(data.set$MMRAcquisitionAuctionCleanPrice)] <-
+      apply(impute.data$imp$MMRAcquisitionAuctionCleanPrice, 1, mean)
+data.set$MMRAcquisitionRetailAveragePrice[is.na(data.set$MMRAcquisitionRetailAveragePrice)] <-
+      apply(impute.data$imp$MMRAcquisitionRetailAveragePrice, 1, mean)
+data.set$MMRAcquisitionRetailCleanPrice[is.na(data.set$MMRAcquisitionRetailCleanPrice)] <-
+      apply(impute.data$imp$MMRAcquisitionRetailCleanPrice, 1, mean)
+data.set$MMRCurrentAuctionAveragePrice[is.na(data.set$MMRCurrentAuctionAveragePrice)] <-
+      apply(impute.data$imp$MMRCurrentAuctionAveragePrice, 1, mean)
+data.set$MMRCurrentAuctionCleanPrice[is.na(data.set$MMRCurrentAuctionCleanPrice)] <- 
+      apply(impute.data$imp$MMRCurrentAuctionCleanPrice, 1, mean)
+data.set$MMRCurrentRetailAveragePrice[is.na(data.set$MMRCurrentRetailAveragePrice)] <- apply(impute.data$imp$MMRCurrentRetailAveragePrice, 1, mean)
+data.set$MMRCurrentRetailCleanPrice[is.na(data.set$MMRCurrentRetailCleanPrice)] <- 
+      apply(impute.data$imp$MMRCurrentRetailCleanPrice, 1, mean)
+rm(sub.data.MMR);rm(impute.data)
+```
+
+Imputing Vehicle Size field
+
+```{r Impute Size field, warning = FALSE, message = FALSE, results = "hide"}
+sub.data.size <- select(data.set, meTrim, meModel, meMake, Size)
+impute.data <- mice(sub.data.size, m = 7, maxit = 5, method = "cart")
+data.set$Size[is.na(data.set$Size)] <- apply(impute.data$imp$Size, 1, mode)
+rm(sub.data.size);rm(impute.data)
+```
+
+Imputing Vehicle Cost field
+
+```{r Imputing Cost, warning = FALSE, message = FALSE, results = "hide"}
+sub.data.cost <- select(data.set, meModel, meMake, VehYear, VehBCost)
+impute.data <- mice(sub.data.cost, m = 7, maxit = 5)
+data.set$VehBCost[is.na(data.set$VehBCost)] <- apply(impute.data$imp$VehBCost, 1, mean)
+rm(sub.data.cost);rm(impute.data)
+```
+
+#### Performing Means Encoding on newly imputed fields
+
+```{r Means Encoding Size, NumCyls, WheelType}
+data.set <- data.set %>% mutate(meSize = means_encoding(data.set, "Size", "IsBadBuy"),
+                                meNumCyls = means_encoding(data.set, "NumCyls", "IsBadBuy"),
+                                meWheelType = means_encoding(data.set, "WheelType", "IsBadBuy")) %>%
+                         select(-NumCyls, -Size, -WheelType)
+```                         
+
+#### Manually imputing illogical historical pricing values
+
+Some historical pricing values are inaccurate and/or illogical.  Retail values should always be higher than Auction values, 'Clean' cars should always be of equal or higher value than 'Average' cars.  These illogical values will be replaced with adjusted average values.
+
+```{r  MMR Imputing 2}
+MMRmean <- as.data.frame(apply(data.set[,grep("MMR", names(data.set))], 2, mean))
+names(MMRmean) <- c("average")
+data.set$MMRAcquisitionAuctionCleanPrice[data.set$MMRAcquisitionAuctionCleanPrice < data.set$MMRAcquisitionAuctionAveragePrice] <-
+        data.set$MMRAcquisitionAuctionCleanPrice[data.set$MMRAcquisitionAuctionCleanPrice < data.set$MMRAcquisitionAuctionAveragePrice] * MMRmean$average[2]/MMRmean$average[1]
+data.set$MMRAcquisitionRetailAveragePrice[data.set$MMRAcquisitionRetailAveragePrice < data.set$MMRAcquisitionAuctionAveragePrice] <-
+        data.set$MMRAcquisitionRetailAveragePrice[data.set$MMRAcquisitionRetailAveragePrice < data.set$MMRAcquisitionAuctionAveragePrice] * 
+        MMRmean$average[3]/MMRmean$average[1]
+data.set$MMRAcquisitionRetailCleanPrice[data.set$MMRAcquisitionRetailCleanPrice < data.set$MMRAcquisitionRetailAveragePrice] <-
+        data.set$MMRAcquisitionRetailCleanPrice[data.set$MMRAcquisitionRetailCleanPrice < data.set$MMRAcquisitionRetailAveragePrice] * 
+        MMRmean$average[4]/MMRmean$average[3]
+data.set$MMRCurrentAuctionCleanPrice[data.set$MMRCurrentAuctionCleanPrice < data.set$MMRCurrentAuctionAveragePrice] <-
+        data.set$MMRCurrentAuctionCleanPrice[data.set$MMRCurrentAuctionCleanPrice < data.set$MMRCurrentAuctionAveragePrice] * 
+        MMRmean$average[6]/MMRmean$average[5]
+data.set$MMRCurrentRetailAveragePrice[data.set$MMRCurrentRetailAveragePrice < data.set$MMRCurrentAuctionAveragePrice] <-
+        data.set$MMRCurrentRetailAveragePrice[data.set$MMRCurrentRetailAveragePrice < data.set$MMRCurrentAuctionAveragePrice] * 
+        MMRmean$average[7]/MMRmean$average[5]
+data.set$MMRCurrentRetailCleanPrice[data.set$MMRCurrentRetailCleanPrice < data.set$MMRCurrentRetailAveragePrice] <-
+        data.set$MMRCurrentRetailCleanPrice[data.set$MMRCurrentRetailCleanPrice < data.set$MMRCurrentRetailAveragePrice] * 
+        MMRmean$average[8]/MMRmean$average[7]
+```
+
+#### Generating additional Features
+
+Historical pricing differences can give insight into profits/losses of vehicle models.  Additionally, warranty costs are an indicator of typical repair costs that vehicles typically see.  Various ratios involving mileage, cost, age, etc are also solid indicators of a vehicle's overall condition.
+
+```{r More feature generation}
+data.set <- data.set %>% mutate(AARA = MMRAcquisitionAuctionCleanPrice - MMRAcquisitionAuctionAveragePrice,
+                                ARCA = MMRAcquisitionRetailCleanPrice - MMRAcquisitionRetailAveragePrice,
+                                CACA = MMRCurrentAuctionCleanPrice - MMRCurrentAuctionAveragePrice,
+                                CRCA = MMRCurrentRetailCleanPrice - MMRCurrentRetailAveragePrice,
+                                ARAA = MMRAcquisitionRetailAveragePrice - MMRAcquisitionAuctionAveragePrice,
+                                ARAC = MMRAcquisitionRetailCleanPrice - MMRAcquisitionAuctionCleanPrice,
+                                CRAA = MMRCurrentRetailAveragePrice - MMRCurrentAuctionAveragePrice,
+                                CRAC = MMRCurrentRetailCleanPrice - MMRCurrentAuctionCleanPrice,
+                                mpy = VehOdo/(VehicleAge + 1),
+                                cpy = VehBCost/(VehicleAge + 1),
+                                cpm = VehBCost/VehOdo,
+                                wpc = WarrantyCost/VehBCost,
+                                VehYear = as.numeric(VehYear),
+                                VehicleAge = as.numeric(VehicleAge),
+                                VehOdo = as.numeric(VehOdo),
+                                IsOnlineSale = as.numeric(IsOnlineSale),
+                                WarrantyCost = as.numeric(WarrantyCost))
+```
+
+#### Removing highly correlated fields
+
+```{r Correlation}
+nn <- select(data.set, IsBadBuy, set)
+data.set <- select(data.set, -IsBadBuy, -set)
+correlation <- cor(data.set)
+fc <- findCorrelation(correlation, cutoff = 0.98)
+data.set <- as.data.frame(cbind(nn, data.set[,-fc]))
+rm(nn)
+```
+
+#### Removing extraneous characters from field names
+
+```{r Extraneous Characters in Field names}
+names(data.set)[grep("=| ", names(data.set))] <- gsub("=| ", "", names(data.set)[grep("=", names(data.set))])
+```
+
+#### Reserving IDs for later use
+
+```{r Test set IDs}
+test.ID <- data.set$RefId[data.set$set == "test"]
+```
+
+#### Scaling numerical data
+
+```{r Scaling fields}
+to.be.scaled <- grep("VehYear|VehicleAge|VehOdo|MMR.*|VehBCost|WarrantyCost|YearPurchased|MonthPurchased|DayPurchase|YearDiscrepancy|AdjDaysSincePurchase|AARA|ARCA|CACA|CRCA|ARAC|CRAC|mpy|cpy", 
+                     names(data.set))
+data.set[,to.be.scaled] <- sapply(to.be.scaled, function(x) scale(data.set[,x]))
+```
+
+#### Splitting data back into train and test sets
+
+```{r Splitting data}
+training.set <- data.set %>% filter(set == "train") %>%
+                             select(-set, -RefId)
+test.set <- data.set %>% filter(set == "test") %>%
+                         select(-IsBadBuy, -set, -RefId)
+```
+
+#### Converting response variable to factor
+
+```{r IsBadBuy factor}
+training.set$IsBadBuy <- as.factor(training.set$IsBadBuy)
+```
+
+#### Examining class balance of response
+
+The training set is an unbalanced dataset with a class balance ratio of approximately 8:1.  The SMOTE function will append additional modified listings to the training set to offset this.  As a result, the class balance is much more even.
+
+```{r SMOTE}
+table(training.set$IsBadBuy)
+training.set <- SMOTE(IsBadBuy~., data = training.set, perc.over = 315, perc.under = 115, k = 4)
+table(training.set$IsBadBuy)
+```
+
+### Model Generation
+
+The final model will be an ensemble of 3 distinct models that will be trained below.  Once each of the 3 models is trained, their results will be aggregated into a data frame and a final model will be trained on those figures.  The reason behind this is twofold:  1)  no model is perfect, so an aggregate of several models will help to smooth out the errors of any one particular model and 2) some models are invariably better at picking up on certain nuances in the data structure than others, so the idea is to feed mulitple model results into a final model in order to identify when certain models are more accurate.  
+
+Because various modeling functions require the data to be formatted in different ways, the original training set will remain unmodified and subsections below for each individual model will reformat the data in such as way that the corresponding modeling function can use.
+
+#### Creating RandomForest model
+
+```{r Random Forest Model}
+intrain <- createDataPartition(training.set$IsBadBuy, p = 0.7, list = FALSE)
+val.set <- training.set[-intrain,]
+train.set <- training.set[intrain,]
+
+rf <- randomForest(IsBadBuy~., 
+                   data = train.set, 
+                   ntree = 1000,
+                   importance = TRUE,
+                   keep.forest = TRUE)
+```
+
+#### RandomForest predictions
+
+```{r RandomForest predictions}
+rf.predict <- predict(rf, select(val.set, -IsBadBuy))
+confusionMatrix(as.factor(rf.predict), as.factor(val.set$IsBadBuy))
+```
+
+#### Creating Gradient Boosted Tree Model
+
+```{r GBM Model}
+intrain <- createDataPartition(training.set$IsBadBuy, p = 0.7, list = FALSE)
+val.set <- training.set[-intrain,]
+train.set <- training.set[intrain,]
+train.y <- as.matrix(train.set$IsBadBuy)
+train.x <- as.matrix(select(train.set, -IsBadBuy))
+val.y <- as.matrix(val.set$IsBadBuy)
+val.x <- as.matrix(select(val.set, -IsBadBuy))
+
+tg <- list(max_depth = 5,
+           eta = 0.01,
+           gamma = 0,
+           colsample_bytree = 1,
+           min_child_weight = 0.5,
+           subsample = 1,
+           num_class = 2,
+           eval_metric = "mlogloss",
+           objective = "multi:softprob")
+
+gb <- xgboost(data = train.x,
+              label = train.y,
+              params = tg,
+              nrounds = 7000,
+              verbose = 1,
+              print_every_n = 500)
+```
+
+#### Gradient Boosted Tree Predictions
+
+The prediction function outputs probabilities rather than class predictions.  Probabilities will be used in the final model, but for a summary of the results, the probabilities are converted to predictions.
+
+```{r GBM predictions}
+gb.predict <- predict(gb, val.x)
+gb.predict <- as.data.frame(matrix(data = gb.predict, nrow = 0.5*length(gb.predict), ncol = 2, byrow = TRUE))
+names(gb.predict) <- c("zero", "one")
+gb.predict$class <- ifelse(gb.predict$one >= gb.predict$zero, 1, 0)
+confusionMatrix(as.factor(gb.predict$class), as.factor(val.y))
+```
+
+#### Creating AdaBoost model
+
+```{r Adaboost Model}
+
+intrain <- createDataPartition(training.set$IsBadBuy, p = 0.7, list = FALSE)
+val.set <- training.set[-intrain,]
+train.set <- training.set[intrain,]
+train.y <- as.matrix(as.numeric(train.set$IsBadBuy) - 1)
+train.y <- ifelse(train.y == 1, 1, -1)
+train.x <- as.matrix(select(train.set, -IsBadBuy))
+val.y <- as.matrix(val.set$IsBadBuy)
+val.x <- as.matrix(select(val.set, -IsBadBuy))
+
+ab <- adaboost(X = train.x, y = train.y, tree_depth = 5, n_rounds = 1500)
+```
+
+#### Adaboost Predictions
+
+```{r Adaboost prediction}
+ab.predict <- predict(ab, val.x)
+ab.p <- ifelse(ab.predict == 1, 1, 0)
+confusionMatrix(as.factor(val.y), as.factor(ab.p))
+```
+ 
+#### Compiling predictions of various models and validation outcomes
+
+```{r Ensemble data.frame}
+ens <- data.frame(boosted = gb.predict$one,
+                  randomforest = as.numeric(rf.predict),
+                  ada = ab.predict,
+                  result = as.factor(val.y))
+```
+
+### Generating final ensemble model and predictions for submission
+
+#### Creating Random Forest ensemble model
+
+```{r RF Ensemble}
+rf.ens <- randomForest(result~., 
+                       data = ens, 
+                       ntree = 250,
+                       keep.forest = TRUE)
+```
+
+#### Generating test results based on test set predictions and ensemble model
+
+```{r Final models predictions, warning = FALSE}
+final.gbm.predict <- predict(gb, as.matrix(test.set))
+final.rf.predict <- predict(rf, test.set)
+final.ada.predict <- predict(ab, as.matrix(test.set))
+final.gbm.predict <- as.data.frame(matrix(data = final.gbm.predict, nrow = 0.5*length(final.gbm.predict), ncol = 2, byrow = TRUE))
+names(final.gbm.predict) <- c("zero", "one")
+final.gbm.predict <- final.gbm.predict$one
+```
+
+#### Final Predictions dataframe
+
+```{r Final dataframe, warning = FALSE}
+edf <- data.frame(boosted = final.gbm.predict,
+                  randomforest = as.numeric(final.rf.predict),
+                  ada = final.ada.predict) 
+```
+
+#### Generating final ensemble predictions and writing to csv
+
+```{r Last Ensemble Predictions}
+final <- predict(rf.ens, edf)
+final <- as.data.frame(cbind(test.ID, final))
+names(final) <- c("RefId", "IsBadBuy")
+final$IsBadBuy <- final$IsBadBuy - 1
+write.csv(final, paste(wd, "finalguess.csv"), row.names = FALSE)
+```
